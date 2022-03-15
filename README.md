@@ -8,3 +8,4 @@ requirements를 올릴려고 했지만 그렇게 올리면 각 모듈이 꼬여 
  
 torch==1.10.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
 transformers==4.17.0
+pip install git+https://github.com/google/sentencepiece.git
