@@ -42,16 +42,16 @@ from simcse.trainers import CLTrainer
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+from psutil import cpu_count
 
 @dataclass
 class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
-    model_name = "beomi/kcbert-base" if False else "monologg/koelectra-base-v3-discriminator"
     # Huggingface's original arguments
     model_name_or_path: Optional[str] = field(
-        default=model_name,
+        default=None,
         metadata={
             "help": "The model checkpoint for weights initialization."
             "Don't set if you want to train a model from scratch."
@@ -62,10 +62,12 @@ class ModelArguments:
         metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
     config_name: Optional[str] = field(
-        default=model_name, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+        default=None, 
+        metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
     tokenizer_name: Optional[str] = field(
-        default=model_name, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+        default=None, 
+        metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
         default=None,
@@ -152,11 +154,11 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+
     # ================================ data_dir ================================
     # SimCSE's arguments
     train_file: Optional[str] = field(
-
-        default=os.path.abspath("/github/SimCSE/data/lawtime_passage.txt"), 
+        default=None, 
         metadata={"help": "The training data file (.txt or .csv)."}
     )
     # ================================ data_dir ================================
@@ -208,14 +210,9 @@ class OurTrainingArguments(TrainingArguments):
     )
 
     # ========================= custom_section =========================    
-    
-    t = {re.sub("tm_*", "", x):getattr(localtime(), x) for x in dir(localtime()) if re.match("tm_*", x) != None}
-    model_name = "-".join(ModelArguments.model_name.split("/"))
 
     output_dir: str = field(
-        default=os.path.abspath(
-            f"""./[unsup]SimCSE/[{t["mon"]}-{t["mday"]}-{t["hour"]}:{t["min"]}:{t["sec"]}]SimCSE-{model_name}"""
-            )
+        default=None
     )
     num_train_epochs: int = field(
         default=9 # best score: 9
@@ -274,8 +271,15 @@ class OurTrainingArguments(TrainingArguments):
         default=1000000
     )
     pre_evaluation: bool = field(
+        default=False,
+        metadata={"help": """
+        주의사항: 사전 eval을 진행하면 fp16환경에서 정상적으로 진행이 안될 수 있다. 이걸 작성하고 있는 시점에서 아직 해결하지 못함.
+        """}
+    )
+    original_train_data_load: bool = field(
         default=False
     )
+
     dataloader_drop_last: bool = field(
         default=True
     )# drop_last를 하지 않으면 학습 중간에 
@@ -344,7 +348,23 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        
+        model_name = "beomi/kcbert-base" if False else "monologg/koelectra-base-v3-discriminator"
 
+        model_args.model_name_or_path = model_name\
+            if model_args.model_name_or_path == None \
+                else model_args.model_name_or_path
+        import re
+        t = {re.sub("tm_*", "", x):getattr(localtime(), x) for x in dir(localtime()) if re.match("tm_*", x) != None}
+        model_name = "-".join(model_args.model_name_or_path.split("/"))
+        DIR_NAME = f"""[unsup]SimCSE/[{t["mon"]}-{t["mday"]}-{t["hour"]}:{t["min"]}:{t["sec"]}]SimCSE-{model_name}"""
+        OUT_DIR = os.path.abspath(f"""workspace/{DIR_NAME}""")
+        
+        training_args.output_dir = OUT_DIR \
+            if OUT_DIR == None \
+                else training_args.output_dir + f"/{DIR_NAME}"
+
+        print(f"""\n{training_args.output_dir}\n""")
     if (
         os.path.exists(training_args.output_dir)
         and os.listdir(training_args.output_dir)
@@ -355,6 +375,8 @@ def main():
             f"Output directory ({training_args.output_dir}) already exists and is not empty."
             "Use --overwrite_output_dir to overcome."
         )
+
+
 
     # Setup logging
     logging.basicConfig(
@@ -388,7 +410,7 @@ def main():
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     data_files = {}
-    if False:
+    if training_args.original_train_data_load:
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
         extension = data_args.train_file.split(".")[-1]
@@ -398,15 +420,18 @@ def main():
             datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
         else:
             datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
-
     # ========================= custom_section =========================
 
-    if True:
+    else:
         import re
-        from psutil import cpu_count
         regex = lambda x: {"text":re.sub(r'(\\t)|(\\r)|(\\n)|(\[\')|(\'\])|(\\)', "", x["text"]).strip()}
-        #실제로 데이터를 불러오는 부분.
-        loaded_data = Dataset.from_text(os.path.abspath("github/SimCSE/data/lawtime_passage.txt"))
+        
+        #데이터를 불러오는 부분.
+        if data_args.train_file:
+            loaded_data = Dataset.from_text(data_args.train_file)
+        else:
+            loaded_data = Dataset.from_text(os.path.abspath("/data/lawtime_passage.txt"))
+
         refine_data = loaded_data.map(regex, num_proc=cpu_count())
         datasets = refine_data.train_test_split(test_size=0.1, train_size=0.9)
 
@@ -442,6 +467,8 @@ def main():
     if model_args.tokenizer_name:
 
         model_name = model_args.tokenizer_name
+        # ========================= custom_section =========================
+
         if "kobert" in model_name and "monologg" in model_name:
             from tokenization_kobert import KoBertTokenizer
             tokenizer = tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
@@ -451,15 +478,23 @@ def main():
             from gluonnlp.data import SentencepieceTokenizer
             tokenizer = SentencepieceTokenizer(get_tokenizer())
             print("\n============== SimCSE : [skt/kobert] ==============\n")
+
+        # ========================= custom_section =========================
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
     elif model_args.model_name_or_path:
 
         model_name = model_args.model_name_or_path
+
+        # ========================= custom_section =========================
+
         if "kobert" in model_name and "monologg" in model_name:
             from tokenization_kobert import KoBertTokenizer
             tokenizer = tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
             print("============== SimCSE : Select [monologg/kobert] Cross_model ==============")
+
+        # ========================= custom_section =========================
+
         else:
 
             tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
@@ -552,7 +587,12 @@ def main():
         sentences = examples["text"]
         # sentences = examples[sent0_cname] + examples[sent1_cname]
         # ^^^^^^^^^^^^^^^^^^^^^ 되돌려 놓을 것 ^^^^^^^^^^^^^^^^^^^^^
+
+
+        # ========================= custom_section =========================
+
         if ModelArguments.do_mlm:
+            # masking을 하는 부분. 전체 단어중 15%의 비율로 masking을 함.
             import random
             for idx_y, train_data in enumerate(sentences):
 
@@ -566,6 +606,8 @@ def main():
                     train_data[idx_x] = tokenizer._mask_token
 
                 sentences[idx_y] = ' '.join(train_data)
+
+        # ========================= custom_section =========================
 
         # If hard negative exists
         if sent2_cname is not None:
@@ -702,6 +744,10 @@ def main():
         data_collator=data_collator,
     )
     trainer.model_args = model_args
+
+
+    # ========================= custom_section =========================
+
     if training_args.pre_evaluation:
         
         logger.info("*** Evaluate ***")
@@ -715,6 +761,11 @@ def main():
                     for key, value in sorted(results.items()):
                         logger.info(f"  {key} = {value}")
                         writer.write(f"{key} = {value}\n")
+
+    #Caution: cuda를 true, fp16을 True로 한 상태에서 사전 evaluate를 진행하면 에러가 발생한다.
+    # 아마  trainer.py 167번줄의 encode[k] = encode[k].to(f"cuda:{device_idx}") 때문에 발생하는 문제인거 같다.
+
+    # ========================= custom_section =========================
 
     # Training
     if training_args.do_train:
@@ -760,7 +811,11 @@ def _mp_fn(index):
 
 
 if __name__ == "__main__":
+    # ========================= custom_section =========================
+
     import setproctitle
-    setproctitle.setproctitle('[SimCSE]Electra_test')
+    setproctitle.setproctitle('[SimCSE]test')
     os.environ["CUDA_VISIBLE_DEVICES"] = '1, 2, 3'
+
+    # ========================= custom_section =========================
     main()
