@@ -10,6 +10,7 @@
 	때문에 pytorch는 맨 마지막에 설치하는 걸 권장.
 
  2. output_dir에는 오직 경로만
+
 	 학습된 결과는 [unsup]SimCSE라는 폴더에
 
 	> [mon-day-hour:min:sec]SimCSE-model_name
