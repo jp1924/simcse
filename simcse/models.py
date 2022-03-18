@@ -17,6 +17,8 @@ from transformers.file_utils import (
 )
 from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
 
+import pandas as pd
+
 class MLPLayer(nn.Module):
     """
     Head for getting sentence representations over RoBERTa/BERT's CLS representation.
@@ -63,7 +65,7 @@ class Pooler(nn.Module):
 
     def forward(self, attention_mask, outputs):
         last_hidden = outputs.last_hidden_state
-        #pooler_output = outputs.pooler_output
+        pooler_output = outputs.pooler_output
         hidden_states = outputs.hidden_states
 
         if self.pooler_type in ['cls_before_pooler', 'cls']:
@@ -83,6 +85,13 @@ class Pooler(nn.Module):
         else:
             raise NotImplementedError
 
+def align_loss(x, y, alpha=2):
+    return (x - y).norm(p=2, dim=1).pow(alpha).mean()
+
+
+def uniform_loss(x, t=2):
+    return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
+
 
 def cl_init(cls, config):
     """
@@ -94,6 +103,8 @@ def cl_init(cls, config):
         cls.mlp = MLPLayer(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
+    cls.align = []
+    cls.uniform = []
 
 def cl_forward(cls,
     encoder,
@@ -135,7 +146,7 @@ def cl_forward(cls,
         output_attentions=output_attentions,
         output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
         return_dict=True,
-    )# 여기서 실수형의 weight값으로 바뀜.
+    )
 
     # MLM auxiliary objective
     if mlm_input_ids is not None:
@@ -162,7 +173,10 @@ def cl_forward(cls,
         pooler_output = cls.mlp(pooler_output)
 
     # Separate representation
-    z1, z2 = pooler_output[:,0], pooler_output[:,1] # 여기기 positive와 negative를 나누는 곳.
+    z1, z2 = pooler_output[:,0], pooler_output[:,1]
+
+    cls.align.append(align_loss(z1, z2))
+    cls.uniform.append(uniform_loss(z2))
 
     # Hard negative
     if num_sent == 3:
@@ -203,6 +217,7 @@ def cl_forward(cls,
 
     # Calculate loss with hard negatives
     if num_sent == 3:
+
         # Note that weights are actually logits of weights
         z3_weight = cls.model_args.hard_negative_weight
         weights = torch.tensor(
@@ -315,8 +330,7 @@ class BertForCL(BertPreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, 
-                encoder=self.bert,
+            return cl_forward(self, self.bert,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -374,8 +388,7 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, 
-                encoder=self.roberta,
+            return cl_forward(self, self.roberta,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -446,8 +459,3 @@ class ElectraForCL(ElectraPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
             )
-# [Batch_size, 2, Sentence_length] -> [(Batch_size * 2), Sentence_length] -> encode -> [(Batch_size * 2), embedding_vectors[0:768]] ->
-# [Batch_size, 2, embedding_vectors] -> [batch_size, embedding_vectors] * 2 (여기서 embedding)
-
-# bert for x
-# 

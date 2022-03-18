@@ -72,196 +72,117 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 if is_datasets_available():
     import datasets
 
-from transformers.modeling_utils import unwrap_model # <<<<<<<<<< 이 부분에서 UPDATE ISSUE 발생, TRANSFORMERS 4.17.0에서 정상적으로 존재함.
+from transformers.modeling_utils import unwrap_model
 from transformers.optimization import Adafactor, AdamW, get_scheduler
 import copy
+# Set path to SentEval
+PATH_TO_SENTEVAL = './senteval'
+PATH_TO_DATA = '/home/jsb193/github/simcse/simcse/senteval/data'
 
+sys.path.insert(0, PATH_TO_SENTEVAL)
+from .senteval.engine import SE
 import numpy as np
 from datetime import datetime
 from filelock import FileLock
 from datasets import load_dataset, concatenate_datasets
+import pandas as pd
 
 logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
-    def klue_sts(self):
-        STS_data = load_dataset("klue", "sts")
-
-        split_data = [STS_data[name] for name in STS_data]
-        pd_STS = concatenate_datasets(split_data).to_pandas()
-        pd_STS = pd_STS.dropna(axis=0).loc[:,["sentence1", "sentence2", "labels"]]
-
-        sel_label = lambda x: x["label"]
-        pd_STS["labels"] = pd_STS["labels"].apply(func=sel_label)
-        label = pd_STS["labels"].values.tolist()
-
-        sentence1 = sum(pd_STS.loc[:,["sentence1"]].values.tolist(), [])
-        sentence2 = sum(pd_STS.loc[:,["sentence2"]].values.tolist(), [])
-
-        return sentence1, sentence2, label
-    # ^^^^^^^ CUSTOM ^^^^^^^
-    def kor_sts(self):
-        STS_data = load_dataset("kor_nlu", "sts")
-
-        max_len = self.model.config.max_position_embeddings
-
-        split_data = [STS_data[name] for name in STS_data]
-        pd_STS = concatenate_datasets(split_data).to_pandas().dropna(axis=0)
-
-
-        sel_idx = np.where((pd_STS["sentence2"].str.len()<=200)&(pd_STS["sentence1"].str.len()<=200), True, False)
-        pd_STS = pd_STS.loc[sel_idx, ["sentence1", "sentence2", "score"]]
-        pd_STS = pd_STS.loc[1:, ["sentence1", "sentence2", "score"]]
-
-        label = pd_STS["score"].values.tolist()
-        sentence1 = sum(pd_STS.loc[:,["sentence1"]].values.tolist(), [])
-        sentence2 = sum(pd_STS.loc[:,["sentence2"]].values.tolist(), [])
-
-        return sentence1, sentence2, label
-    # ^^^^^^^ CUSTOM ^^^^^^^
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
-        eval_senteval_transfer: bool = False,
+        save_uniform_and_align: bool = False,
     ) -> Dict[str, float]:
+        # SentEval prepare and batcher
+
+        def prepare(params, samples):
+            return
+
+        def batcher(params, batch):
+            #연산을 수행하는 부분.
+            sentences = batch
+            #sentences = [' '.join(s) for s in batch]
+            batch = self.tokenizer.batch_encode_plus(
+                sentences,
+                return_tensors='pt',
+                padding=True,
+            )
+            for k in batch:
+                batch[k] = batch[k].cuda()#to(self.args.device)
+            with torch.no_grad():
+                outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+                pooler_output = outputs.pooler_output
+            return pooler_output.cpu()
+
+        # Set params for SentEval (fastmode)
+        params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
+        params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
+                                            'tenacity': 3, 'epoch_size': 2}
+
+        se = SE(params, batcher, prepare)
+        tasks = ["korsts", "kluests"]
+
+        self.model.eval()
+
+        calculation_result = se.eval(tasks)
         
+        kor_sts = [calculation_result["korsts"][x] for x in range(1, len(calculation_result["korsts"])-1)]
+        klue_sts = [calculation_result["kluests"][x] for x in range(1, len(calculation_result["kluests"])-1)]
 
-        if (not self.args.eval_original) and (self.args.eval_bi or self.args.eval_cross):
-            from sentence_transformers import CrossEncoder
+        pd.DataFrame(kor_sts).transpose().to_csv(f"{self.args.output_dir}/compare_kor_{self.state.global_step}.csv")
+        pd.DataFrame(klue_sts).transpose().to_csv(f"{self.args.output_dir}/compare_klue_{self.state.global_step}.csv")
+        # 이 부분은 학습에 사용된 문장과  문장을 토대로 추출한 유사도 값을 비교하기 위해 값들을 저장하는 구간이다.
 
-            import tqdm
-            import numpy as np
-            from scipy.stats import spearmanr, pearsonr
-            from sklearn.metrics.pairwise import paired_cosine_distances, paired_euclidean_distances, paired_manhattan_distances
 
-            if self.args.eval_bi:
-                def batcher(batch):
-                    sentences = batch#[' '.join(s) for s in batch]
-                    batch_size = 10
-                    device_idx = 1
-                    self.model.to(f"cuda:{device_idx}")
+        results = {"korsts":calculation_result["korsts"][0], "kluests":calculation_result["kluests"][0]}
 
-                    pooler_output = []
+        if "korsts" in results and "kluests" in results:
 
-                    batch = [batch[x*batch_size:(x+1)*batch_size] for x in range(round(len(sentences)/batch_size)+1)]
-                    if batch[-1] == []:
-                        batch.pop(-1)
-                        
-                    for mini_batch in tqdm.tqdm(batch):
-                        encode = self.tokenizer(
-                            mini_batch,
-                            max_length=200,
-                            truncation=True,
-                            return_tensors='pt',
-                            padding='max_length',
-                        )
+            if self.state.epoch != None:
+                results["korsts"]["epoch"] = float(f"{self.state.epoch:.2f}")
+                results["kluests"]["epoch"] = float(f"{self.state.epoch:.2f}")
+            if "eval_korsts_result" in dir(self) and "eval_kluests_result" in dir(self):
+                buff_kor = pd.DataFrame([results["korsts"]], index=[self.state.global_step])
+                buff_klue = pd.DataFrame([results["kluests"]], index=[self.state.global_step])
 
-                        for k in encode:
-                            encode[k] = encode[k].to(f"cuda:{device_idx}")
-                        with torch.no_grad():
-                            
-                            outputs = self.model(**encode, output_hidden_states=True, return_dict=True, sent_emb=True)
+                print(buff_kor)
+                print(buff_klue)
 
-                            pooler_output.append(outputs.pooler_output.cpu())
-                            
-                    return torch.cat(pooler_output)
+                self.eval_korsts_result = \
+                    pd.concat([self.eval_korsts_result, buff_kor], axis=0)
+                self.eval_kluests_result = \
+                    pd.concat([self.eval_kluests_result, buff_klue], axis=0)
 
-                def cosine(u, v): # 지금 코드에서는 이 부분은 사용하지 않음.
-                    return np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))
-                
-                    similarity = lambda s1, s2: np.nan_to_num(cosine(np.nan_to_num(s1), np.nan_to_num(s2)))
-                    score = [similarity(s1, s2) for s1, s2 in zip(sen_enc1, sen_enc2)]
+                if save_uniform_and_align:
 
-                    # KorSTS값이 이상해서 mean한 값[np.mean(score[x*10:(x+1)*10]) for x in range(int(len(score) / 10))]
+                    align = self.model.align
+                    uniform = self.model.uniform
 
-                result_list = []
+                    align = [ele.detach().cpu().numpy() for ele in align]
+                    uniform = [ele.detach().cpu().numpy() for ele in uniform]
 
-                for sentence1, sentence2, label in [self.kor_sts(), self.klue_sts()]:
+                    mean_align = [np.mean([align[0+(3+x)], align[1+(3+x)], align[2+(3+x)]]) for x in range(len(align) // 3)]
 
-                    sen_enc1 = batcher(sentence1)
-                    sen_enc2 = batcher(sentence2)
-
-                    cosine_scores = 1 - (paired_cosine_distances(sen_enc1, sen_enc2))
-                    manhattan_distances = -paired_manhattan_distances(sen_enc1, sen_enc2)
-                    euclidean_distances = -paired_euclidean_distances(sen_enc1, sen_enc2)
-                    dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(sen_enc1, sen_enc2)]
-
-                    eval_pearson_cosine = pearsonr(label, cosine_scores)
-                    eval_spearman_cosine = spearmanr(label, cosine_scores)
-
-                    eval_pearson_manhattan = pearsonr(label, manhattan_distances)
-                    eval_spearman_manhattan = spearmanr(label, manhattan_distances)
-
-                    eval_pearson_euclidean = pearsonr(label, euclidean_distances)
-                    eval_spearman_euclidean = spearmanr(label, euclidean_distances)
-
-                    eval_pearson_dot = pearsonr(label, dot_products)
-                    eval_spearman_dot = spearmanr(label, dot_products)
-
-                    score = {'eval_pearson_cosine': eval_pearson_cosine,
-                            'eval_spearman_cosine': eval_spearman_cosine,
-                            'eval_pearson_manhattan': eval_pearson_manhattan,
-                            'eval_spearman_manhattan': eval_spearman_manhattan,
-                            'eval_pearson_euclidean': eval_pearson_euclidean,
-                            'eval_spearman_euclidean': eval_spearman_euclidean,
-                            'eval_pearson_dot': eval_pearson_dot,
-                            'eval_spearman_dot': eval_spearman_dot}
-
-                    # 위의 유사도 측정은 koSimCSE의 
-                    # https://github.com/BM-K/KoSimCSE-SKT/blob/f28d6b2682e4195ef1d4cdae2df5397af6d64db0/model/loss.py#L31
-                    # 이 부분을 따옴
-                    result_list.append(score)
-    
-                torch.cuda.empty_cache()
-
-                return result_list
-            elif self.args.eval_cross:
-
-                return
+                    mean_uniform = [np.mean([uniform[0+(3+x)], uniform[1+(3+x)], uniform[2+(3+x)]]) for x in range(len(uniform) // 3)]
+                    
+                    pd.DataFrame({"align":mean_align, "uniform":mean_uniform}).to_csv(f"{self.args.output_dir}/align_uniform.csv")
+                    del mean_uniform, mean_align, align, uniform
             else:
-                NotImplementedError()
-        # ^^^^^^^ CUSTOM ^^^^^^^
-        elif Original:
-            # Set path to SentEval
-            PATH_TO_SENTEVAL = './SentEval'
-            PATH_TO_DATA = './SentEval/data'
+                print("****** Pre-Evaluate ******")
+                korsts_pd = pd.DataFrame([results["korsts"]])
+                kluests_pd = pd.DataFrame([results["kluests"]])
 
-            # Import SentEval
-            sys.path.insert(0, PATH_TO_SENTEVAL)
+                print(korsts_pd)
+                print(kluests_pd)
 
-            # SentEval prepare and batcher
-            def prepare(params, samples):
-                return
-
-            def batcher(params, batch):
-                #연산을 수행하는 부분.
-                sentences = [' '.join(s) for s in batch]
-                batch = self.tokenizer.batch_encode_plus(
-                    sentences,
-                    return_tensors='pt',
-                    padding=True,
-                )
-                for k in batch:
-                    batch[k] = batch[k].to(self.args.device)
-                with torch.no_grad():
-                    outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                    pooler_output = outputs.pooler_output
-                return pooler_output.cpu()
-
-            # Set params for SentEval (fastmode)
-            params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
-            params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
-                                                'tenacity': 3, 'epoch_size': 2}
-
-            se = senteval.engine.SE(params, batcher, prepare)
-            tasks = ['STSBenchmark', 'SICKRelatedness']
-            if eval_senteval_transfer or self.args.eval_transfer:
-                tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
-            self.model.eval()
-            results = se.eval(tasks)
-            
+                korsts_pd.to_csv(f"{self.args.output_dir}/pre_eval_kor.csv")
+                kluests_pd.to_csv(f"{self.args.output_dir}/pre_eval_klue.csv")
+            return results
+        else:
             stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
             sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
 
@@ -275,10 +196,79 @@ class CLTrainer(Trainer):
                 metrics['eval_avg_transfer'] = avg_transfer
 
             self.log(metrics)
-            return metrics
-        else:
-            NotImplementedError()
-        
+
+            def batcher(batch):
+                sentences = batch#[' '.join(s) for s in batch]
+                batch_size = 10
+                device_idx = 1
+                self.model.to(f"cuda:{device_idx}")
+
+                pooler_output = []
+
+                batch = [batch[x*batch_size:(x+1)*batch_size] for x in range(round(len(sentences)/batch_size)+1)]
+                if batch[-1] == []:
+                    batch.pop(-1)
+                    
+                for mini_batch in tqdm.tqdm(batch):
+                    encode = self.tokenizer.batch_encode_plus(
+                        mini_batch,
+                        max_length=200,
+                        truncation=True,
+                        return_tensors='pt',
+                        padding='max_length',
+                    )
+
+                    # for k in encode:
+                    #     encode[k] = encode[k].to("cuda:1")
+                    with torch.no_grad():
+                        
+                        outputs = self.model(**encode, output_hidden_states=True, return_dict=True, sent_emb=True).to("cpu")
+
+                        pooler_output.append(outputs.pooler_output.cpu())
+                        
+                return torch.cat(pooler_output)
+
+            result_list = []
+
+            for sentence1, sentence2, label, name in [self.kor_sts(), self.klue_sts()]:
+
+                sen_enc1 = batcher(sentence1)
+                sen_enc2 = batcher(sentence2)
+
+                cosine_scores = 1 - (paired_cosine_distances(sen_enc1, sen_enc2))
+                manhattan_distances = -paired_manhattan_distances(sen_enc1, sen_enc2)
+                euclidean_distances = -paired_euclidean_distances(sen_enc1, sen_enc2)
+                dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(sen_enc1, sen_enc2)]
+
+                eval_pearson_cosine, _ = pearsonr(label, cosine_scores)
+                eval_spearman_cosine, _ = spearmanr(label, cosine_scores)
+
+                eval_pearson_manhattan, _ = pearsonr(label, manhattan_distances)
+                eval_spearman_manhattan, _ = spearmanr(label, manhattan_distances)
+
+                eval_pearson_euclidean, _ = pearsonr(label, euclidean_distances)
+                eval_spearman_euclidean, _ = spearmanr(label, euclidean_distances)
+
+                eval_pearson_dot, _ = pearsonr(label, dot_products)
+                eval_spearman_dot, _ = spearmanr(label, dot_products)
+
+                score = {f'{name}eval_pearson_cosine': f"{eval_pearson_cosine:.4f}",
+                        f'{name}_eval_spearman_cosine': f"{eval_spearman_cosine:.4f}",
+                        f'{name}_eval_pearson_manhattan': f"{eval_pearson_manhattan:.4f}",
+                        f'{name}_eval_spearman_manhattan': f"{eval_spearman_manhattan:.4f}",
+                        f'{name}_eval_pearson_euclidean': f"{eval_pearson_euclidean:.4f}",
+                        f'{name}_eval_spearman_euclidean': f"{eval_spearman_euclidean:.4f}",
+                        f'{name}_eval_pearson_dot': f"{eval_pearson_dot:.4f}",
+                        f'{name}_eval_spearman_dot': f"{eval_spearman_dot:.4f}"}
+
+                # 위의 유사도 측정은 koSimCSE의 
+                # https://github.com/BM-K/KoSimCSE-SKT/blob/f28d6b2682e4195ef1d4cdae2df5397af6d64db0/model/loss.py#L31
+                # 이 부분을 따옴
+                result_list.append(score)
+
+            result_list[0].update(result_list[1])
+            self.log(result_list[0])
+            return 
     def _save_checkpoint(self, model, trial, metrics=None):
         """
         Compared to original implementation, we change the saving policy to
@@ -312,7 +302,7 @@ class CLTrainer(Trainer):
                     self.deepspeed.save_checkpoint(output_dir)
 
                 # Save optimizer and scheduler
-                if False: # self.sharded_dpp:
+                if self.sharded_ddp:
                     self.optimizer.consolidate_state_dict()
 
                 if is_torch_tpu_available():
@@ -354,7 +344,7 @@ class CLTrainer(Trainer):
                 self.deepspeed.save_checkpoint(output_dir)
 
             # Save optimizer and scheduler
-            if self.sharded_dpp:
+            if self.sharded_ddp:
                 self.optimizer.consolidate_state_dict()
 
             if is_torch_tpu_available():
@@ -389,11 +379,17 @@ class CLTrainer(Trainer):
                 training will resume from the optimizer/scheduler states loaded here.
             trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
                 The trial run or the hyperparameter dictionary for hyperparameter search.
-
+        
         The main difference between ours and Huggingface's original implementation is that we 
         also load model_args when reloading best checkpoints for evaluation.
         """
         # This might change the seed so needs to run first.
+        self.eval_korsts_result = pd.DataFrame()
+        self.eval_kluests_result = pd.DataFrame()
+
+        self.align_save = []
+        self.uniform_save = []
+
         self._hp_search_setup(trial)
 
         # Model re-init
@@ -465,7 +461,8 @@ class CLTrainer(Trainer):
             model = torch.nn.DataParallel(model)
 
         # Distributed training (should be after apex fp16 initialization)
-        if False:# self.sharded_dpp:
+        # sharded_dpp >>> sharded_ddp, 옆에 p가 하나가 더 들어가서 dpp가 되어 있었다. 어이가 없네.....
+        if self.sharded_ddp:
             model = ShardedDDP(model, self.optimizer)
         elif self.args.local_rank != -1:
             model = torch.nn.parallel.DistributedDataParallel(
@@ -622,6 +619,7 @@ class CLTrainer(Trainer):
                                 amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
                                 self.args.max_grad_norm,
                             )
+
                     # Optimizer step
                     if is_torch_tpu_available():
                         xm.optimizer_step(self.optimizer)
@@ -638,8 +636,8 @@ class CLTrainer(Trainer):
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
-                    ignore_keys_for_eval = None
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+
+                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, None)# 이 부분이 eval을 거치는 부분.
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
