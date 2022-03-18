@@ -8,9 +8,7 @@ import torch
 import collections
 import random
 
-from time import localtime
-import re
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, DatasetDict, DownloadConfig, concatenate_datasets
 
 import transformers
 from transformers import (
@@ -36,22 +34,28 @@ from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy,
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models import RobertaForCL, BertForCL, ElectraForCL
+from simcse.models import RobertaForCL, BertForCL
 from simcse.trainers import CLTrainer
+
+from time import localtime
+import re
+import pandas as pd
+import numpy as np
+from psutil import cpu_count
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-from psutil import cpu_count
 
 @dataclass
 class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
+    model_name = "klue/roberta-base"
     # Huggingface's original arguments
     model_name_or_path: Optional[str] = field(
-        default=None,
+        default=model_name,
         metadata={
             "help": "The model checkpoint for weights initialization."
             "Don't set if you want to train a model from scratch."
@@ -62,11 +66,11 @@ class ModelArguments:
         metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
     config_name: Optional[str] = field(
-        default=None, 
+        default=model_name, 
         metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
     tokenizer_name: Optional[str] = field(
-        default=None, 
+        default=model_name, 
         metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
@@ -91,37 +95,37 @@ class ModelArguments:
 
     # SimCSE's arguments
     temp: float = field(
-        default=0.06,# 0.05
+        default=0.06,
         metadata={
             "help": "Temperature for softmax."
         }
     )
     pooler_type: str = field(
-        default="avg", # cls
+        default="cls",
         metadata={
             "help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last)."
         }
     ) 
     hard_negative_weight: float = field(
-        default=0,
+        default=0.06,
         metadata={
             "help": "The **logit** of weight for hard negatives (only effective if hard negatives are used)."
         }
     )
     do_mlm: bool = field(
-        default=False, # False
+        default=True,
         metadata={
             "help": "Whether to use MLM auxiliary objective."
         }
     )
     mlm_weight: float = field(
-        default=0.1, # 0.1
+        default=0.1,
         metadata={
             "help": "Weight for MLM auxiliary objective (only effective if --do_mlm)."
         }
     )
     mlp_only_train: bool = field(
-        default=False, # False
+        default=True,
         metadata={
             "help": "Use MLP only during training"
         }
@@ -151,17 +155,15 @@ class DataTrainingArguments:
         },
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=None,
+        default=cpu_count(),
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
 
-    # ================================ data_dir ================================
     # SimCSE's arguments
     train_file: Optional[str] = field(
-        default=None, 
+        default="/home/jsb193/github/simcse/data/lawtime_passage.txt", 
         metadata={"help": "The training data file (.txt or .csv)."}
     )
-    # ================================ data_dir ================================
     max_seq_length: Optional[int] = field(
         default=32,
         metadata={
@@ -170,33 +172,16 @@ class DataTrainingArguments:
         },
     )
     pad_to_max_length: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to pad all samples to `max_seq_length`. "
             "If False, will pad the samples dynamically when batching to the maximum length in the batch."
         },
     )
-    return_tensors: bool = field(
-        default=False,
-        metadata={
-            "help":"토크나이징시 pytorch_tensor로 변환 할지 말지를 결정하는 부분"
-            "pytorch_tensor로 return을 할 때 무조건 pad_to_max_length를 True로 만들어 줘야함."
-            "그렇지 않으면 에러가 발생함."
-        }
-    )
     mlm_probability: float = field(
         default=0.15, 
         metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
     )
-
-    def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
-
 
 @dataclass
 class OurTrainingArguments(TrainingArguments):
@@ -209,57 +194,49 @@ class OurTrainingArguments(TrainingArguments):
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
 
-    # ========================= custom_section =========================    
+    t = {re.sub("tm_*", "", x):getattr(localtime(), x) for x in dir(localtime()) if re.match("tm_*", x) != None}
+    model_name = "-".join(ModelArguments.model_name_or_path.split("/"))
+
+    DIR_NAME = f"""[unsup]SimCSE/[{t["mon"]}-{t["mday"]}-{t["hour"]}:{t["min"]}:{t["sec"]}]SimCSE-{model_name}"""
+    OUTPUT = "/home/jsb193/github/simcse"
 
     output_dir: str = field(
-        default=None
+        default=os.path.abspath(f"""{OUTPUT}/{DIR_NAME}""")
     )
     num_train_epochs: int = field(
-        default=9 # best score: 9
+        default=3 # best score: 9
     )
     per_device_train_batch_size: int = field(
-        default=512 # 256
+        default=120 # 256
+    )
+    gradient_accumulation_steps: int = field(
+        default=5
     )
     learning_rate: float = field(
         default=3e-5
     )
-    eval_original: bool = field(
-        default= False,
-        metadata={"help":"eval_bi와 eval_cross 둘다 False라면 작동하지 않음."
-        "false이여야 custom evaluation라인이 작동함."
-        }
-    )
-    eval_bi: bool = field(
-        default=True,
-        metadata={"help":"eval_original이 False라면 작동하지 않는다."}        
-    )
-    eval_cross: bool = field(
-        default=True,
-        metadata={"help":"eval_original이 False라면 작동하지 않는다."}    
-    )
     do_train: bool = field(
         default=True
     )
+
     do_eval: bool = field(
         default=True
     )
     eval_steps: int = field(
-        default=125
+        default=4
     )
+    evaluation_strategy: str = field(
+        default="steps"
+    )
+
     do_predict: bool = field(
         default=False
     )
     fp16: bool = field(
         default=True
     )
-    fp16_full_eval: bool = field(
-        default=False
-    )
     no_cuda: bool = field(
         default= False
-    )
-    metric_for_best_model: str = field(
-        default="stsb_spearman"
     )
     logging_strategy: str = field(
         default="steps"
@@ -270,24 +247,25 @@ class OurTrainingArguments(TrainingArguments):
     save_steps: int = field(
         default=1000000
     )
-    pre_evaluation: bool = field(
-        default=False,
-        metadata={"help": """
-        주의사항: 사전 eval을 진행하면 fp16환경에서 정상적으로 진행이 안될 수 있다. 이걸 작성하고 있는 시점에서 아직 해결하지 못함.
-        """}
+    local_rank: int = field(
+        default=-1
     )
-    original_train_data_load: bool = field(
+    overwrite_output_dir: bool = field(
         default=False
     )
-
+    load_best_model_at_end: bool = field(
+        default=False
+    )
+    fp16_opt_level: str = field(
+        default="O2"
+    )
     dataloader_drop_last: bool = field(
         default=True
-    )# drop_last를 하지 않으면 학습 중간에 
+    )# lawtime_passage.txt에서만 생기는 문제
+     # drop_last를 하지 않으면 학습 중간에 
      # Input tensor at index 3 has invalid shape [2, 2], but expected [2, 5]
      # 와 같은 에러가 발생함.
      # 이유 : 254 batch로 들어가던 데이터가 마지막에 17batch로 들어가서 생기는 에러.
-    # ========================= custom_section =========================
-
     @cached_property
     @torch_required
     def _setup_devices(self) -> "torch.device":
@@ -348,23 +326,7 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        
-        model_name = "beomi/kcbert-base" if False else "monologg/koelectra-base-v3-discriminator"
 
-        model_args.model_name_or_path = model_name\
-            if model_args.model_name_or_path == None \
-                else model_args.model_name_or_path
-        import re
-        t = {re.sub("tm_*", "", x):getattr(localtime(), x) for x in dir(localtime()) if re.match("tm_*", x) != None}
-        model_name = "-".join(model_args.model_name_or_path.split("/"))
-        DIR_NAME = f"""[unsup]SimCSE/[{t["mon"]}-{t["mday"]}-{t["hour"]}:{t["min"]}:{t["sec"]}]SimCSE-{model_name}"""
-        OUT_DIR = os.path.abspath(f"""workspace/{DIR_NAME}""")
-        
-        training_args.output_dir = OUT_DIR \
-            if OUT_DIR == None \
-                else training_args.output_dir + f"/{DIR_NAME}"
-
-        print(f"""\n{training_args.output_dir}\n""")
     if (
         os.path.exists(training_args.output_dir)
         and os.listdir(training_args.output_dir)
@@ -375,8 +337,6 @@ def main():
             f"Output directory ({training_args.output_dir}) already exists and is not empty."
             "Use --overwrite_output_dir to overcome."
         )
-
-
 
     # Setup logging
     logging.basicConfig(
@@ -397,54 +357,42 @@ def main():
         transformers.utils.logging.enable_explicit_format()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column. You can easily tweak this
-    # behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
+
     data_files = {}
-    if training_args.original_train_data_load:
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-        extension = data_args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-        if extension == "csv":
-            datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
+    if data_args.train_file is not None:
+        data_files["train"] = data_args.train_file
+    extension = data_args.train_file.split(".")[-1]
+    if extension == "txt":
+        extension = "text"
+    if extension == "csv":
+        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter=",")
+    else:
+        if "kornli" in data_args.train_file.lower():
+            NLI_data = load_dataset("kor_nlu", "nli", ignore_verifications=True)
+
+            split_data = [NLI_data[name] for name in NLI_data]
+            pd_NLI = concatenate_datasets(split_data).to_pandas().dropna(axis=0)
+
+
+            sel_idx = np.where((pd_NLI["premise"].str.len()<=200)&(pd_NLI["hypothesis"].str.len()<=200), True, False)
+            pd_NLI = pd_NLI.loc[sel_idx, ["premise", "hypothesis", "label"]]
+            
+            label_chn = lambda x: "neutral" if x == 1 else "contradiction" if 2 == x else "entailment" if x == 0 else None
+            pd_NLI["label"] = pd_NLI["label"].apply(label_chn)
+            NLI = Dataset.from_pandas(pd_NLI).remove_columns("__index_level_0__")
+            datasets = DatasetDict({"train":NLI})
+        elif "lawtime_passage.txt" in data_args.train_file.lower():
+            regex = lambda x: {"text":re.sub(r'(\\t)|(\\r)|(\\n)|(\[\')|(\'\])|(\\)', "", x["text"]).strip()}
+        
+            loaded_data = Dataset.from_text(data_args.train_file)
+
+            refine_data = loaded_data.map(regex, num_proc=data_args.preprocessing_num_workers)
+            datasets = refine_data.train_test_split(test_size=0.1, train_size=0.9)
         else:
             datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
-    # ========================= custom_section =========================
 
-    else:
-        import re
-        regex = lambda x: {"text":re.sub(r'(\\t)|(\\r)|(\\n)|(\[\')|(\'\])|(\\)', "", x["text"]).strip()}
-        
-        #데이터를 불러오는 부분.
-        if data_args.train_file:
-            loaded_data = Dataset.from_text(data_args.train_file)
-        else:
-            loaded_data = Dataset.from_text(os.path.abspath("/data/lawtime_passage.txt"))
-
-        refine_data = loaded_data.map(regex, num_proc=cpu_count())
-        datasets = refine_data.train_test_split(test_size=0.1, train_size=0.9)
-
-    # ========================= custom_section =========================
-
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
-
-    # Load pretrained model and tokenizer
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -464,11 +412,9 @@ def main():
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
     }
+
     if model_args.tokenizer_name:
-
         model_name = model_args.tokenizer_name
-        # ========================= custom_section =========================
-
         if "kobert" in model_name and "monologg" in model_name:
             from tokenization_kobert import KoBertTokenizer
             tokenizer = tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
@@ -478,26 +424,10 @@ def main():
             from gluonnlp.data import SentencepieceTokenizer
             tokenizer = SentencepieceTokenizer(get_tokenizer())
             print("\n============== SimCSE : [skt/kobert] ==============\n")
-
-        # ========================= custom_section =========================
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
     elif model_args.model_name_or_path:
-
-        model_name = model_args.model_name_or_path
-
-        # ========================= custom_section =========================
-
-        if "kobert" in model_name and "monologg" in model_name:
-            from tokenization_kobert import KoBertTokenizer
-            tokenizer = tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
-            print("============== SimCSE : Select [monologg/kobert] Cross_model ==============")
-
-        # ========================= custom_section =========================
-
-        else:
-
-            tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
@@ -566,48 +496,17 @@ def main():
     else:
         raise NotImplementedError
 
-    # 데이터 encoding부분
     def prepare_features(examples):
-        # padding = longest (default)
-        #   If no sentence in the batch exceed the max length, then use
-        #   the max sentence length in the batch, otherwise use the 
-        #   max sentence length in the argument and truncate those that
-        #   exceed the max length.
-        # padding = max_length (when pad_to_max_length, for pressure test)
-        #   All sentences are padded/truncated to data_args.max_seq_length.
+
         total = len(examples[sent0_cname])
 
-        # Avoid "None" fields , 필터링 거치는 부분
+        # Avoid "None" fields 
         for idx in range(total):
             if examples[sent0_cname][idx] is None:
                 examples[sent0_cname][idx] = " "
             if examples[sent1_cname][idx] is None:
                 examples[sent1_cname][idx] = " "
-        # 여기서 input된 데이터를 두개로 만듬.
-        sentences = examples["text"]
-        # sentences = examples[sent0_cname] + examples[sent1_cname]
-        # ^^^^^^^^^^^^^^^^^^^^^ 되돌려 놓을 것 ^^^^^^^^^^^^^^^^^^^^^
-
-
-        # ========================= custom_section =========================
-
-        if ModelArguments.do_mlm:
-            # masking을 하는 부분. 전체 단어중 15%의 비율로 masking을 함.
-            import random
-            for idx_y, train_data in enumerate(sentences):
-
-                train_data = train_data.split(' ')
-                word_num = len(train_data)
-
-                count_max = int(word_num * 0.1215) if isinstance(word_num * 0.1215, float) else word_num * 0.1215
-
-                for count_y, idx_x in enumerate(random.sample(range(0, word_num-1), count_max)):
-
-                    train_data[idx_x] = tokenizer._mask_token
-
-                sentences[idx_y] = ' '.join(train_data)
-
-        # ========================= custom_section =========================
+        sentences = examples[sent0_cname] + examples[sent1_cname]
 
         # If hard negative exists
         if sent2_cname is not None:
@@ -621,37 +520,24 @@ def main():
             max_length=data_args.max_seq_length,
             truncation=True,
             padding="max_length" if data_args.pad_to_max_length else False,
-            return_tensors= "pt" if data_args.return_tensors else None
         )
 
         features = {}
+
         if sent2_cname is not None:
             for key in sent_features:
                 features[key] = [[sent_features[key][i], sent_features[key][i+total], sent_features[key][i+total*2]] for i in range(total)]
         else:
             for key in sent_features:
-                # features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
-                # ^^^^^^^^^^^^^^^^^^^^^ 되돌려 놓을 것 ^^^^^^^^^^^^^^^^^^^^^
-                features[key] = [[sent_features[key][i], sent_features[key][i]] for i in range(total)]
-                # [key][i+total] -> [key][i]
-
-                # 이 부분이 sentence pair를 만드는 부분
-        # ========================= 방법 =========================
-        # 1. 동일한 데이터 셋 2개를 만든 다음 이들을 concat함 ex : 1000개 데이터가 있다면 1000 + 1000개를 붙여 2000개로 만듬
-        # 2. 붙인 데이터를 tokenizer에다가 넣어서 encoding시킴
-        # 3. encoding시킨 데이터가 2000개 라고 했을 때 0번과 1000번 데이터를 서로 붙임
-        # 4. 이걸 각 데이터마다 진행시켜줌
-        # =========================== ? ===========================
-        # [[sent_features[key][i], sent_features[key][i+total]] 에서 sent_features[key][i+total]와 같이 하지말고 차라리
-        # [[sent_features[key][i], sent_features[key][i]]를 하면 되지 않나? 그럼 동일한 데이터를 두번 붙여서 n*2로 만들 필요도 없고
-        # tokenizing을 진행하면서 속도도 더 빨라질거같은데.....
+                features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
+        
         return features
 
     if training_args.do_train:
         train_dataset = datasets["train"].map(
             prepare_features,
             batched=True,
-            # num_proc=cpu_count(),
+            num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
@@ -745,27 +631,7 @@ def main():
     )
     trainer.model_args = model_args
 
-
-    # ========================= custom_section =========================
-
-    if training_args.pre_evaluation:
-        
-        logger.info("*** Evaluate ***")
-        result_list = trainer.evaluate(eval_senteval_transfer=True)
-
-        output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
-        if trainer.is_world_process_zero():
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for results in result_list:
-                    for key, value in sorted(results.items()):
-                        logger.info(f"  {key} = {value}")
-                        writer.write(f"{key} = {value}\n")
-
-    #Caution: cuda를 true, fp16을 True로 한 상태에서 사전 evaluate를 진행하면 에러가 발생한다.
-    # 아마  trainer.py 167번줄의 encode[k] = encode[k].to(f"cuda:{device_idx}") 때문에 발생하는 문제인거 같다.
-
-    # ========================= custom_section =========================
+    # result_list = trainer.evaluate(eval_senteval_transfer=False)
 
     # Training
     if training_args.do_train:
@@ -791,15 +657,18 @@ def main():
     # Evaluation
     results = {}
     if training_args.do_eval:
+
         logger.info("*** Evaluate ***")
-        result_list = trainer.evaluate(eval_senteval_transfer=True)
+        result_list = trainer.evaluate(save_uniform_and_align=True)
+        trainer.eval_korsts_result.to_csv(f"{training_args.output_dir}/kor_eval.csv")
+        trainer.eval_kluests_result.to_csv(f"{training_args.output_dir}/klue_eval.csv")
 
         output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
         if trainer.is_world_process_zero():
             with open(output_eval_file, "w") as writer:
                 logger.info("***** Eval results *****")
-                for results in result_list:
-                    for key, value in sorted(results.items()):
+                for results in result_list.keys():
+                    for key, value in sorted(result_list[results].items()):
                         logger.info(f"  {key} = {value}")
                         writer.write(f"{key} = {value}\n")
 
@@ -811,11 +680,7 @@ def _mp_fn(index):
 
 
 if __name__ == "__main__":
-    # ========================= custom_section =========================
-
     import setproctitle
     setproctitle.setproctitle('[SimCSE]test')
     os.environ["CUDA_VISIBLE_DEVICES"] = '1, 2, 3'
-
-    # ========================= custom_section =========================
     main()
