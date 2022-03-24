@@ -25,9 +25,9 @@
 	 skt/kobert는 gluonnlp의 sentencepiece tokenizer를 사용하기 때문에 모델을 로딩하는 도중에 에러가 발생함
 	 skt/kobert대신 monologg kobert를 사용하는 걸 추천 
 
-
-	>     https://github.com/princeton-nlp/SimCSE/blob/main/simcse/models.py#L194-L212
-
-	>     https://github.com/jeongukjae/KR-BERT-SimCSE/blob/main/model.py#L106-L122
-
-	>     https://github.com/BM-K/KoSimCSE-SKT/blob/main/model/loss.py#L21-L29
+SimCSE
+>     https://github.com/princeton-nlp/SimCSE/blob/main/simcse/models.py#L194-L212
+KR-SimCSE
+>     https://github.com/jeongukjae/KR-BERT-SimCSE/blob/main/model.py#L106-L122
+KoSimCSE-skt
+>     https://github.com/BM-K/KoSimCSE-SKT/blob/main/model/loss.py#L21-L29
