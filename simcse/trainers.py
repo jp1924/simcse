@@ -77,7 +77,7 @@ from transformers.optimization import Adafactor, AdamW, get_scheduler
 import copy
 # Set path to SentEval
 PATH_TO_SENTEVAL = './senteval'
-PATH_TO_DATA = '/home/jsb193/github/simcse/simcse/senteval/data'
+PATH_TO_DATA = '/home/jsb193/prospector/github/simcse/simcse/senteval/data'
 
 sys.path.insert(0, PATH_TO_SENTEVAL)
 from .senteval.engine import SE
@@ -86,16 +86,45 @@ from datetime import datetime
 from filelock import FileLock
 from datasets import load_dataset, concatenate_datasets
 import pandas as pd
-
+from scipy.spatial.distance import cosine
 logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
+
+    def simcse(self, text1, text2, text3):
+        # Tokenize input texts
+        texts = [
+            text1,
+            text2,
+            text3
+        ]
+        inputs = self.tokenizer.batch_encode_plus(texts, padding=True, truncation=True, return_tensors="pt")
+        for k in inputs:
+            inputs[k] = inputs[k].cuda()#to(self.args.device)
+        # Get the embeddings
+        with torch.no_grad():
+            embeddings = self.model(**inputs, output_hidden_states=True, return_dict=True, sent_emb=True).pooler_output.cpu()
+
+        # Calculate cosine similarities
+        # Cosine similarities are in [-1, 1]. Higher means more similar
+        cosine_sim_0_1 = 1 - cosine(embeddings[0], embeddings[1])
+        cosine_sim_0_2 = 1 - cosine(embeddings[0], embeddings[2])
+        return {"cosine similarity":cosine_sim_0_1}, {"cosine similarity":cosine_sim_0_2}
+
+    def save_ali_uni(self):
+        align = sum(self.args.align, [])
+        unifo = sum(self.args.unifo, [])
+        pd.DataFrame({"align":align, "uniform":unifo}).to_csv(f"{self.args.output_dir}/align_uniform_step:{self.state.global_step}.csv")  
+
+    def history_save(self):
+        pd.DataFrame(self.state.log_history).to_csv(f"{self.args.output_dir}/log_history.csv")
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
-        save_uniform_and_align: bool = False,
+        save: bool = False, eval_list = []
     ) -> Dict[str, float]:
         # SentEval prepare and batcher
 
@@ -103,9 +132,11 @@ class CLTrainer(Trainer):
             return
 
         def batcher(params, batch):
-            #연산을 수행하는 부분.
-            sentences = batch
-            #sentences = [' '.join(s) for s in batch]
+            if params.current_task in ['STSBenchmark', 'SICKRelatedness', \
+                'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
+                sentences = [' '.join(s) for s in batch]
+            else:
+                sentences = batch
             batch = self.tokenizer.batch_encode_plus(
                 sentences,
                 return_tensors='pt',
@@ -117,158 +148,94 @@ class CLTrainer(Trainer):
                 outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
                 pooler_output = outputs.pooler_output
             return pooler_output.cpu()
-
+        def check_valid(task_name, result):
+            result = {task_name:result[task_name][0]}
+            if self.state.epoch:
+                result[task_name]["epoch"] = float(f"{self.state.epoch:.2f}")
+                    
+            if "kluests" in task_name:
+                step_for_klue = pd.DataFrame([result[task_name]], index=[self.state.global_step])
+                self.eval_kluests_result = \
+                    pd.concat([self.eval_kluests_result, step_for_klue], axis=0)
+            elif "korsts" in task_name:
+                step_for_kor = pd.DataFrame([result["korsts"]], index=[self.state.global_step])
+                self.eval_korsts_result = \
+                    pd.concat([self.eval_korsts_result, step_for_kor], axis=0)                    
+            else:
+                NotImplementedError()   
         # Set params for SentEval (fastmode)
         params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
         params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
                                             'tenacity': 3, 'epoch_size': 2}
 
         se = SE(params, batcher, prepare)
-        tasks = ["korsts", "kluests"]
-
+        if eval_list: tasks = eval_list
+        else: tasks = ["korsts", "kluests"]
         self.model.eval()
 
-        calculation_result = se.eval(tasks)
+        result = se.eval(tasks)
         
-        kor_sts = [calculation_result["korsts"][x] for x in range(1, len(calculation_result["korsts"])-1)]
-        klue_sts = [calculation_result["kluests"][x] for x in range(1, len(calculation_result["kluests"])-1)]
-
-        pd.DataFrame(kor_sts).transpose().to_csv(f"{self.args.output_dir}/compare_kor_{self.state.global_step}.csv")
-        pd.DataFrame(klue_sts).transpose().to_csv(f"{self.args.output_dir}/compare_klue_{self.state.global_step}.csv")
-        # 이 부분은 학습에 사용된 문장과  문장을 토대로 추출한 유사도 값을 비교하기 위해 값들을 저장하는 구간이다.
+        check_kor_task = result.keys()
 
 
-        results = {"korsts":calculation_result["korsts"][0], "kluests":calculation_result["kluests"][0]}
+        if "korsts" in check_kor_task or "kluests" in check_kor_task:
+            if "kluests" in check_kor_task:
+                check_valid("kluests", result)
+            if "korsts" in check_kor_task:
+                check_valid("korsts", result)
 
-        if "korsts" in results and "kluests" in results:
-
-            if self.state.epoch != None:
-                results["korsts"]["epoch"] = float(f"{self.state.epoch:.2f}")
-                results["kluests"]["epoch"] = float(f"{self.state.epoch:.2f}")
-            if "eval_korsts_result" in dir(self) and "eval_kluests_result" in dir(self):
-                buff_kor = pd.DataFrame([results["korsts"]], index=[self.state.global_step])
-                buff_klue = pd.DataFrame([results["kluests"]], index=[self.state.global_step])
-
-                print(buff_kor)
-                print(buff_klue)
-
-                self.eval_korsts_result = \
-                    pd.concat([self.eval_korsts_result, buff_kor], axis=0)
-                self.eval_kluests_result = \
-                    pd.concat([self.eval_kluests_result, buff_klue], axis=0)
-
-                if save_uniform_and_align:
-
-                    align = self.model.align
-                    uniform = self.model.uniform
-
-                    align = [ele.detach().cpu().numpy() for ele in align]
-                    uniform = [ele.detach().cpu().numpy() for ele in uniform]
-
-                    mean_align = [np.mean([align[0+(3+x)], align[1+(3+x)], align[2+(3+x)]]) for x in range(len(align) // 3)]
-
-                    mean_uniform = [np.mean([uniform[0+(3+x)], uniform[1+(3+x)], uniform[2+(3+x)]]) for x in range(len(uniform) // 3)]
-                    
-                    pd.DataFrame({"align":mean_align, "uniform":mean_uniform}).to_csv(f"{self.args.output_dir}/align_uniform.csv")
-                    del mean_uniform, mean_align, align, uniform
-            else:
-                print("****** Pre-Evaluate ******")
-                korsts_pd = pd.DataFrame([results["korsts"]])
-                kluests_pd = pd.DataFrame([results["kluests"]])
-
-                print(korsts_pd)
-                print(kluests_pd)
-
-                korsts_pd.to_csv(f"{self.args.output_dir}/pre_eval_kor.csv")
-                kluests_pd.to_csv(f"{self.args.output_dir}/pre_eval_klue.csv")
-            return results
+            if save:# 이 부분은 학습이 끝나고 난 뒤에 저장하는 부분이다
+                self.save_ali_uni()
+                if "kluests" in check_kor_task:
+                    self.eval_kluests_result.to_csv(f"{self.args.output_dir}/eval_klue.csv")
+                if "korsts" in check_kor_task:
+                    self.eval_korsts_result.to_csv(f"{self.args.output_dir}/eval_kor.csv")
+                self.history_save()
+            return result
         else:
-            stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
-            sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
+            stsb = pd.DataFrame([result["STSBenchmark"]["train"]], index=[self.state.global_step])
+            sickr = pd.DataFrame([result["SICKRelatedness"]["train"]], index=[self.state.global_step])
 
-            metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
-            if eval_senteval_transfer or self.args.eval_transfer:
-                avg_transfer = 0
-                for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
-                    avg_transfer += results[task]['devacc']
-                    metrics['eval_{}'.format(task)] = results[task]['devacc']
-                avg_transfer /= 7
-                metrics['eval_avg_transfer'] = avg_transfer
+            self.eval_korsts_result = \
+                pd.concat([self.eval_korsts_result, stsb], axis=0)# 이름은 이렇지만 stsb가 들어가는 부분이다. 
+            self.eval_kluests_result = \
+                pd.concat([self.eval_kluests_result, sickr], axis=0)# 이름은 이렇지만 sickr가 들어가는 부분이다. 
 
-            self.log(metrics)
+            if save:# 이 부분은 학습이 끝나고 난 뒤에 저장하는 부분이다
+                self.save_ali_uni()
+                self.eval_kluests_result.to_csv(f"{self.args.output_dir}/eval_stsb.csv")
+                self.eval_korsts_result.to_csv(f"{self.args.output_dir}/eval_sickr.csv")
+            
+            self.log(result)
+            return result
 
-            def batcher(batch):
-                sentences = batch#[' '.join(s) for s in batch]
-                batch_size = 10
-                device_idx = 1
-                self.model.to(f"cuda:{device_idx}")
+            
+            # kor_sts = [result["korsts"][x] for x in range(1, len(result["korsts"])-1)]
+            # klue_sts = [result["kluests"][x] for x in range(1, len(result["kluests"])-1)]
 
-                pooler_output = []
+            # pd.DataFrame(kor_sts).transpose().to_csv(f"{self.args.output_dir}/compare_kor_{self.state.global_step}.csv")
+            # pd.DataFrame(klue_sts).transpose().to_csv(f"{self.args.output_dir}/compare_klue_{self.state.global_step}.csv")
+            # 학습에 사용된 문장을 추출한 유사도 값을 비교하기 위해 값들을 저장하는 구간
 
-                batch = [batch[x*batch_size:(x+1)*batch_size] for x in range(round(len(sentences)/batch_size)+1)]
-                if batch[-1] == []:
-                    batch.pop(-1)
-                    
-                for mini_batch in tqdm.tqdm(batch):
-                    encode = self.tokenizer.batch_encode_plus(
-                        mini_batch,
-                        max_length=200,
-                        truncation=True,
-                        return_tensors='pt',
-                        padding='max_length',
-                    )
+            # if self.state.epoch:
+            #     # 학습하기 이전 pre_valid를 하는 경우 epoch값이 정해져 있지 않기 때문에 값이 있는지 없는지 확인한다.
+            #     result["korsts"]["epoch"] = float(f"{self.state.epoch:.2f}")
+            #     result["kluests"]["epoch"] = float(f"{self.state.epoch:.2f}")
 
-                    # for k in encode:
-                    #     encode[k] = encode[k].to("cuda:1")
-                    with torch.no_grad():
-                        
-                        outputs = self.model(**encode, output_hidden_states=True, return_dict=True, sent_emb=True).to("cpu")
 
-                        pooler_output.append(outputs.pooler_output.cpu())
-                        
-                return torch.cat(pooler_output)
+            # stsb_spearman = result['STSBenchmark']['dev']['spearman'][0]
+            # sickr_spearman = result['SICKRelatedness']['dev']['spearman'][0]
+            # metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
+            # if eval_senteval_transfer or self.args.eval_transfer:
+            #     avg_transfer = 0
+            #     for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
+            #         avg_transfer += result[task]['devacc']
+            #         metrics['eval_{}'.format(task)] = result[task]['devacc']
+            #     avg_transfer /= 7
+            #     metrics['eval_avg_transfer'] = avg_transfer
 
-            result_list = []
+            # self.log(metrics)
 
-            for sentence1, sentence2, label, name in [self.kor_sts(), self.klue_sts()]:
-
-                sen_enc1 = batcher(sentence1)
-                sen_enc2 = batcher(sentence2)
-
-                cosine_scores = 1 - (paired_cosine_distances(sen_enc1, sen_enc2))
-                manhattan_distances = -paired_manhattan_distances(sen_enc1, sen_enc2)
-                euclidean_distances = -paired_euclidean_distances(sen_enc1, sen_enc2)
-                dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(sen_enc1, sen_enc2)]
-
-                eval_pearson_cosine, _ = pearsonr(label, cosine_scores)
-                eval_spearman_cosine, _ = spearmanr(label, cosine_scores)
-
-                eval_pearson_manhattan, _ = pearsonr(label, manhattan_distances)
-                eval_spearman_manhattan, _ = spearmanr(label, manhattan_distances)
-
-                eval_pearson_euclidean, _ = pearsonr(label, euclidean_distances)
-                eval_spearman_euclidean, _ = spearmanr(label, euclidean_distances)
-
-                eval_pearson_dot, _ = pearsonr(label, dot_products)
-                eval_spearman_dot, _ = spearmanr(label, dot_products)
-
-                score = {f'{name}eval_pearson_cosine': f"{eval_pearson_cosine:.4f}",
-                        f'{name}_eval_spearman_cosine': f"{eval_spearman_cosine:.4f}",
-                        f'{name}_eval_pearson_manhattan': f"{eval_pearson_manhattan:.4f}",
-                        f'{name}_eval_spearman_manhattan': f"{eval_spearman_manhattan:.4f}",
-                        f'{name}_eval_pearson_euclidean': f"{eval_pearson_euclidean:.4f}",
-                        f'{name}_eval_spearman_euclidean': f"{eval_spearman_euclidean:.4f}",
-                        f'{name}_eval_pearson_dot': f"{eval_pearson_dot:.4f}",
-                        f'{name}_eval_spearman_dot': f"{eval_spearman_dot:.4f}"}
-
-                # 위의 유사도 측정은 koSimCSE의 
-                # https://github.com/BM-K/KoSimCSE-SKT/blob/f28d6b2682e4195ef1d4cdae2df5397af6d64db0/model/loss.py#L31
-                # 이 부분을 따옴
-                result_list.append(score)
-
-            result_list[0].update(result_list[1])
-            self.log(result_list[0])
-            return 
     def _save_checkpoint(self, model, trial, metrics=None):
         """
         Compared to original implementation, we change the saving policy to
@@ -386,10 +353,9 @@ class CLTrainer(Trainer):
         # This might change the seed so needs to run first.
         self.eval_korsts_result = pd.DataFrame()
         self.eval_kluests_result = pd.DataFrame()
-
-        self.align_save = []
-        self.uniform_save = []
-
+        
+        self.args.align = []
+        self.args.unifo = []
         self._hp_search_setup(trial)
 
         # Model re-init
@@ -595,6 +561,7 @@ class CLTrainer(Trainer):
                         tr_loss += self.training_step(model, inputs)
                 else:
                     tr_loss += self.training_step(model, inputs)
+                    torch.cuda.empty_cache()
                 self._total_flos += self.floating_point_ops(inputs)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (

@@ -65,7 +65,7 @@ class Pooler(nn.Module):
 
     def forward(self, attention_mask, outputs):
         last_hidden = outputs.last_hidden_state
-        pooler_output = outputs.pooler_output
+        # pooler_output = outputs.pooler_output
         hidden_states = outputs.hidden_states
 
         if self.pooler_type in ['cls_before_pooler', 'cls']:
@@ -104,7 +104,7 @@ def cl_init(cls, config):
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
     cls.align = []
-    cls.uniform = []
+    cls.unifo = []
 
 def cl_forward(cls,
     encoder,
@@ -175,8 +175,13 @@ def cl_forward(cls,
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
 
-    cls.align.append(align_loss(z1, z2))
-    cls.uniform.append(uniform_loss(z2))
+    cls.s1_vector = z1
+    cls.s2_vector = z2
+
+    cls.align.append(align_loss(cls.s1_vector, cls.s2_vector))
+    cls.unifo.append(\
+        (uniform_loss(cls.s1_vector) + uniform_loss(cls.s2_vector)) / 2
+        )
 
     # Hard negative
     if num_sent == 3:
@@ -237,6 +242,7 @@ def cl_forward(cls,
     if not return_dict:
         output = (cos_sim,) + outputs[2:]
         return ((loss,) + output) if loss is not None else output
+    torch.cuda.empty_cache()
     return SequenceClassifierOutput(
         loss=loss,
         logits=cos_sim,

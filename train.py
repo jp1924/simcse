@@ -28,13 +28,14 @@ from transformers import (
     EvalPrediction,
     BertModel,
     BertForPreTraining,
-    RobertaModel
+    RobertaModel,
+    TrainerCallback
 )
 from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models import RobertaForCL, BertForCL
+from simcse.models import RobertaForCL, BertForCL, ElectraForCL
 from simcse.trainers import CLTrainer
 
 from time import localtime
@@ -52,10 +53,10 @@ class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
-    model_name = "klue/roberta-base"
+
     # Huggingface's original arguments
     model_name_or_path: Optional[str] = field(
-        default=model_name,
+        default=None,
         metadata={
             "help": "The model checkpoint for weights initialization."
             "Don't set if you want to train a model from scratch."
@@ -66,11 +67,11 @@ class ModelArguments:
         metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
     config_name: Optional[str] = field(
-        default=model_name, 
+        default=None, 
         metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
     tokenizer_name: Optional[str] = field(
-        default=model_name, 
+        default=None, 
         metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
@@ -92,10 +93,9 @@ class ModelArguments:
             "with private models)."
         },
     )
-
     # SimCSE's arguments
     temp: float = field(
-        default=0.06,
+        default=0.05,
         metadata={
             "help": "Temperature for softmax."
         }
@@ -107,13 +107,13 @@ class ModelArguments:
         }
     ) 
     hard_negative_weight: float = field(
-        default=0.06,
+        default=0,
         metadata={
             "help": "The **logit** of weight for hard negatives (only effective if hard negatives are used)."
         }
     )
     do_mlm: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to use MLM auxiliary objective."
         }
@@ -125,12 +125,11 @@ class ModelArguments:
         }
     )
     mlp_only_train: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Use MLP only during training"
         }
     )
-
 
 @dataclass
 class DataTrainingArguments:
@@ -161,11 +160,11 @@ class DataTrainingArguments:
 
     # SimCSE's arguments
     train_file: Optional[str] = field(
-        default="/home/jsb193/github/simcse/data/lawtime_passage.txt", 
+        default="/home/jsb193/prospector/github/simcse/data/kr_wikipedia.txt", 
         metadata={"help": "The training data file (.txt or .csv)."}
     )
     max_seq_length: Optional[int] = field(
-        default=32,
+        default=100,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated."
@@ -193,27 +192,27 @@ class OurTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
-
+    # training_steps의 영향이 가는 값일 경우 무조건 eval_steps를 확인하자.
     t = {re.sub("tm_*", "", x):getattr(localtime(), x) for x in dir(localtime()) if re.match("tm_*", x) != None}
     model_name = "-".join(ModelArguments.model_name_or_path.split("/"))
 
     DIR_NAME = f"""[unsup]SimCSE/[{t["mon"]}-{t["mday"]}-{t["hour"]}:{t["min"]}:{t["sec"]}]SimCSE-{model_name}"""
-    OUTPUT = "/home/jsb193/github/simcse"
+    OUTPUT = "/home/jsb193/prospector/github/simcse"
 
     output_dir: str = field(
         default=os.path.abspath(f"""{OUTPUT}/{DIR_NAME}""")
     )
     num_train_epochs: int = field(
-        default=3 # best score: 9
+        default=1
     )
     per_device_train_batch_size: int = field(
-        default=120 # 256
+        default=128
     )
     gradient_accumulation_steps: int = field(
-        default=5
+        default=10
     )
     learning_rate: float = field(
-        default=3e-5
+        default=1e-5
     )
     do_train: bool = field(
         default=True
@@ -223,12 +222,11 @@ class OurTrainingArguments(TrainingArguments):
         default=True
     )
     eval_steps: int = field(
-        default=4
+        default=100
     )
     evaluation_strategy: str = field(
         default="steps"
     )
-
     do_predict: bool = field(
         default=False
     )
@@ -245,7 +243,7 @@ class OurTrainingArguments(TrainingArguments):
         default=1
     )
     save_steps: int = field(
-        default=1000000
+        default=200# 값을 이렇게 만든 이유는 버전 문제인지 file_name_prefix가 없다고 뜬다. checkpoint는 일단 보류.....
     )
     local_rank: int = field(
         default=-1
@@ -260,7 +258,7 @@ class OurTrainingArguments(TrainingArguments):
         default="O2"
     )
     dataloader_drop_last: bool = field(
-        default=True
+        default=False
     )# lawtime_passage.txt에서만 생기는 문제
      # drop_last를 하지 않으면 학습 중간에 
      # Input tensor at index 3 has invalid shape [2, 2], but expected [2, 5]
@@ -313,7 +311,6 @@ class OurTrainingArguments(TrainingArguments):
 
         return device
 
-
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -359,16 +356,16 @@ def main():
 
     set_seed(training_args.seed)
 
-
     data_files = {}
-    if data_args.train_file is not None:
-        data_files["train"] = data_args.train_file
-    extension = data_args.train_file.split(".")[-1]
-    if extension == "txt":
-        extension = "text"
-    if extension == "csv":
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter=",")
-    else:
+
+    def check_foldername(name):
+        if "kornli" in name or "lawtime" in name:
+            return True
+        elif "kr_wikipedia" in name or "klue" in name:
+            return True
+    #[self.simcse("남자가 음식을 먹는다.", "남자가 안녕하세요 먹먹는다.", "여자가 개를 씻긴다.") for _ in range(20)]
+    if check_foldername(data_args.train_file.lower()):
+        # =================== custom ===================
         if "kornli" in data_args.train_file.lower():
             NLI_data = load_dataset("kor_nlu", "nli", ignore_verifications=True)
 
@@ -390,6 +387,31 @@ def main():
 
             refine_data = loaded_data.map(regex, num_proc=data_args.preprocessing_num_workers)
             datasets = refine_data.train_test_split(test_size=0.1, train_size=0.9)
+        elif "klue" in data_args.train_file.lower():
+            # 청소님의 제안으로 한번 klue의 학습 데이터를 이용해 학습을 시킨뒤 dev을 이용해 평가를 내본다.
+            STS_data = load_dataset("klue", "sts", ignore_verifications=True)["train"].to_pandas()
+
+            pd_STS = STS_data.dropna(axis=0).loc[:,["sentence1", "sentence2"]]
+            klue = Dataset.from_pandas(pd_STS).remove_columns("__index_level_0__")
+            datasets = DatasetDict({"train":klue})
+        elif "wikipedia" in data_args.train_file.lower():
+            wiki_data = Dataset.from_text(data_args.train_file).sort("text", kind="quicksort", \
+                load_from_cache_file=True, indices_cache_file_name="sort_result")[1108000:]
+            
+            Datasets
+            wiki_data = Dataset.from_dict(wiki_data)
+            # wiki_data = wiki_data.filter(function=func, batched=True, batch_size=1000, num_proc=data_args.preprocessing_num_workers)
+            datasets = DatasetDict({"train":wiki_data})
+        # =================== custom ===================
+    else:
+
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+        extension = data_args.train_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+        if extension == "csv":
+            datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter=",")
         else:
             datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
 
@@ -416,8 +438,9 @@ def main():
     if model_args.tokenizer_name:
         model_name = model_args.tokenizer_name
         if "kobert" in model_name and "monologg" in model_name:
-            from tokenization_kobert import KoBertTokenizer
-            tokenizer = tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
+
+            from kobert_transformers.tokenization_kobert import KoBertTokenizer
+            tokenizer = KoBertTokenizer.from_pretrained('monologg/kobert')
             print("\n============== SimCSE : [monologg/kobert] ==============\n")
         elif "kobert" in model_name and "skt" in model_name:
             from kobert import get_tokenizer
@@ -498,8 +521,11 @@ def main():
 
     def prepare_features(examples):
 
+        # if not any([True if len(x) > 2 else False for x in examples["text"]][:-3]):
+        #     return tokenizer(["하", "이"]).data
+        
         total = len(examples[sent0_cname])
-
+        
         # Avoid "None" fields 
         for idx in range(total):
             if examples[sent0_cname][idx] is None:
@@ -519,7 +545,7 @@ def main():
             sentences,
             max_length=data_args.max_seq_length,
             truncation=True,
-            padding="max_length" if data_args.pad_to_max_length else False,
+            padding="longest"#"max_length" if data_args.pad_to_max_length else False,
         )
 
         features = {}
@@ -532,11 +558,13 @@ def main():
                 features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
         
         return features
-
+    # func = lambda x: [True if len(x) > 2 else False for x in x["text"]]
+    # .filter(function=func, batched=True, batch_size=64)
     if training_args.do_train:
         train_dataset = datasets["train"].map(
             prepare_features,
             batched=True,
+            batch_size=training_args.per_device_train_batch_size+1, 
             num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
@@ -568,7 +596,7 @@ def main():
             batch = self.tokenizer.pad(
                 flat_features,
                 padding=self.padding,
-                max_length=self.max_length,
+                max_length="longest",
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors="pt",
             )
@@ -621,17 +649,78 @@ def main():
             return inputs, labels
 
     data_collator = default_data_collator if data_args.pad_to_max_length else OurDataCollatorWithPadding(tokenizer)
+    
 
+    class PrinterCallback(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            print('\033[1m'+ '=' * 25 + " Model Training " + '=' * 25 + '\033[0m')
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            print('\n'+ '\033[1m'+ '=' * 25 +' Epoch {:} / {:} '.format(int(trainer.state.epoch) + 1, int(trainer.state.num_train_epochs)) + '=' * 25)
+        # def on_log(self, args, state, control, **kwargs):
+        #     print()
+        def on_step_begin(self, args, state, control, **kwargs):
+            log_strat_name = args.logging_strategy.name.lower()
+            accu_step = args.gradient_accumulation_steps - 1 # -1를 한 이유는 gradient_accumulate를 10회를 한다고 가정하면 logging print는 10회 째에 하기 때문에 원할한 계산을 하기 위해서 -1를 한다.
+            step = state.global_step
+            device_num = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+            if "steps" in log_strat_name and accu_step > 1:     
+                try:       
+                    data_num = accu_step * device_num
+                    # start_ran = data_num * step
+                    # end_ran = data_num * (step + 1)
+
+                    reforming = lambda x :torch.nan_to_num(x).detach().cpu().numpy() 
+
+                    align = [reforming(ele) for ele in kwargs["model"].align]
+                    unifo = [reforming(ele) for ele in kwargs["model"].unifo]
+
+                    kwargs["model"].align = []
+                    kwargs["model"].unifo = []
+
+                    align = [np.mean(\
+                        [align[((y*device_num) + x)] for x in range(0, 4)]
+                        ) for y in range((len(align) // device_num))]
+
+                    unifo = [np.mean(\
+                        [unifo[((y*device_num) + x)] for x in range(0, 4)]
+                        ) for y in range((len(unifo) // device_num))]
+
+                    args.align.append(align)
+                    args.unifo.append(unifo)
+
+                    alignment = (sum(align) / accu_step)
+                    uniformity = (sum(unifo) / accu_step)
+                    result = {"uniformity":f"{uniformity:.3f}","alignment":f"{alignment:.3f}"}
+                    print(result)
+
+                    model
+
+                    state.log_history[-1].update(result)
+                except:
+                    pass
+            elif "steps" in log_strat_name and accu_step <= 1:
+                try:
+                    alignment = [torch.nan_to_num(x) for x in kwargs["model"].align[-device_num:]]
+                    uniformity = [torch.nan_to_num(x) for x in kwargs["model"].uniform[-device_num:]]
+
+                    alignment = (sum([x.cpu() for x in alignment]) / device_num).detach().numpy()
+                    uniformity = (sum([x.cpu() for x in uniformity]) / device_num).detach().numpy()
+                    result = {"uniformity":f"{uniformity:.3f}","alignment":f"{alignment:.3f}"}
+                    print(result)
+
+                    state.log_history[-1].update(result)
+                except:
+                    pass
     trainer = CLTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        callbacks=[PrinterCallback]
     )
     trainer.model_args = model_args
 
-    # result_list = trainer.evaluate(eval_senteval_transfer=False)
 
     # Training
     if training_args.do_train:
@@ -640,6 +729,7 @@ def main():
             if (model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path))
             else None
         )
+        # trainer.log_metrics("train", {"acu":None})
         train_result = trainer.train(model_path=model_path)
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
@@ -659,20 +749,19 @@ def main():
     if training_args.do_eval:
 
         logger.info("*** Evaluate ***")
-        result_list = trainer.evaluate(save_uniform_and_align=True)
-        trainer.eval_korsts_result.to_csv(f"{training_args.output_dir}/kor_eval.csv")
-        trainer.eval_kluests_result.to_csv(f"{training_args.output_dir}/klue_eval.csv")
+        result_list = trainer.evaluate(save=True)
+        # trainer.eval_korsts_result.to_csv(f"{training_args.output_dir}/kor_eval.csv")
+        # trainer.eval_kluests_result.to_csv(f"{training_args.output_dir}/klue_eval.csv")
 
-        output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
-        if trainer.is_world_process_zero():
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for results in result_list.keys():
-                    for key, value in sorted(result_list[results].items()):
-                        logger.info(f"  {key} = {value}")
-                        writer.write(f"{key} = {value}\n")
+        # output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
+        # if trainer.is_world_process_zero():
+        #     with open(output_eval_file, "w") as writer:
+        #         logger.info("***** Eval results *****")
+        #         for results in result_list.keys():
+        #             for key, value in sorted(result_list[results].items()):
+        #                 logger.info(f"  {key} = {value}")
+        #                 writer.write(f"{key} = {value}\n")
 
-    return results
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)
@@ -681,6 +770,6 @@ def _mp_fn(index):
 
 if __name__ == "__main__":
     import setproctitle
-    setproctitle.setproctitle('[SimCSE]test')
-    os.environ["CUDA_VISIBLE_DEVICES"] = '1, 2, 3'
+    setproctitle.setproctitle('[unsupervied]SimCSE test')
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
     main()

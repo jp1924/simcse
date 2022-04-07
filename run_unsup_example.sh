@@ -11,7 +11,7 @@ python3 train.py \
     --num_train_epochs 9 \
     --per_device_train_batch_size 512 \
     --learning_rate 3e-5 \
-    --max_seq_length 32 \
+    --max_seq_length 100 \
     --evaluation_strategy steps \
     --pooler_type avg \
     --mlp_only_train False\
@@ -24,4 +24,8 @@ python3 train.py \
     --original_train_data_load False\
     --logging_strategy steps \
     --logging_steps=1 \
+    --pad_to_max_length=False\
+    --gradient_accumulation_steps=10\
+    --save_steps=200\
+    --logging_steps=1
     "$@"

@@ -18,7 +18,7 @@ import numpy as np
 import logging
 
 from scipy.stats import spearmanr, pearsonr
-
+from scipy.spatial.distance import cityblock, euclidean
 from .utils import cosine
 from .sick import SICKEval
 import scipy.special as special
@@ -58,10 +58,10 @@ class STSEval(object):
         if 'similarity' in params:
             self.similarity = params.similarity
         else:  # Default similarity is cosine
-            self.similarity = lambda s1, s2: np.nan_to_num(cosine(np.nan_to_num(s1), np.nan_to_num(s2)))
+            self.cosine_similarity = lambda s1, s2: np.nan_to_num(cosine(np.nan_to_num(s1), np.nan_to_num(s2)))
         return prepare(params, self.samples)
 
-    def pearsonr_test(self, x, y):
+    def pearsonr_test(self, x, y):# ================ custom ================
         n = len(x)
         if n != len(y):
             raise ValueError('x and y must have the same length.')
@@ -125,13 +125,11 @@ class STSEval(object):
 
         return r, prob
 
-
-
     def run(self, params, batcher):
         results = {}
         all_sys_scores = []
         all_gs_scores = []
-        for dataset in self.datasets:
+        for dataset in self.datasets: # 보통 [A, B, C] 이런 형식으로 데스크가 들어오게 된다.
             sys_scores = []
             input1, input2, gs_scores = self.data[dataset]
 
@@ -156,7 +154,7 @@ class STSEval(object):
                 cosine_scores = (1 - paired_cosine_distances(enc1, enc2)).tolist()
                 manhattan_distances = (-paired_manhattan_distances(enc1, enc2)).tolist()
                 euclidean_distances = (-paired_euclidean_distances(enc1, enc2)).tolist()
-                dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(enc1.detach().tolist(), enc2.detach().tolist())]
+                #dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(enc1.detach().tolist(), enc2.detach().tolist())]
 
                 pearson_test, _ = self.pearsonr_test(gs_scores, cosine_scores)
 
@@ -169,22 +167,27 @@ class STSEval(object):
                 pearson_euclidean, _ = pearsonr(gs_scores, euclidean_distances)
                 spearman_euclidean, _ = spearmanr(gs_scores, euclidean_distances)
 
-                pearson_dot, _ = pearsonr(gs_scores, dot_products)
-                spearman_dot, _ = spearmanr(gs_scores, dot_products)
+                # pearson_dot, _ = pearsonr(gs_scores, dot_products)
+                # spearman_dot, _ = spearmanr(gs_scores, dot_products)
 
                 results = \
                 {f'{name}_pear_cos': f"{pearson_cosine:.4f}",
                  f'{name}_pear_man': f"{pearson_manhattan:.4f}",
                  f'{name}_pear_euclid': f"{pearson_euclidean:.4f}",
-                 f'{name}_pear_dot': f"{pearson_dot:.4f}",
+                #  f'{name}_pear_dot': f"{pearson_dot:.4f}",
                  f'{name}_spear_cos': f"{spearman_cosine:.4f}",
                  f'{name}_spear_man': f"{spearman_manhattan:.4f}",
                  f'{name}_spear_euclid': f"{spearman_euclidean:.4f}",
-                 f'{name}_spear_dot': f"{spearman_dot:.4f}",
+                #  f'{name}_spear_dot': f"{spearman_dot:.4f}",
                   'nsamples': len(gs_scores)}
                     
-                return results, input1, input2, gs_scores, cosine_scores, manhattan_distances, euclidean_distances, dot_products
+                return results, input1, input2, gs_scores, cosine_scores, manhattan_distances, euclidean_distances#, dot_products
             
+            cosine_scores = []
+            euclidean_scores = []
+            manhattan_scores = []
+            dot_scores = []
+
             for ii in range(0, len(gs_scores), params.batch_size):
                 batch1 = input1[ii:ii + params.batch_size]
                 batch2 = input2[ii:ii + params.batch_size]
@@ -195,8 +198,27 @@ class STSEval(object):
                     enc2 = batcher(params, batch2)
 
                     for kk in range(enc2.shape[0]):
-                        sys_score = self.similarity(enc1[kk], enc2[kk])
-                        sys_scores.append(sys_score)
+                        cosine_result = self.cosine_similarity(enc1[kk], enc2[kk])
+
+                        euclidean_result = euclidean(enc1[kk], enc2[kk])
+                        manhattan_result = cityblock(enc1[kk], enc2[kk])
+
+                        cosine_scores.append(cosine_result)
+                        euclidean_scores.append(euclidean_result)
+                        manhattan_scores.append(manhattan_result)
+
+                        # sys_score = self.similarity(enc1[kk], enc2[kk])
+                        # sys_scores.append(sys_score)
+            
+            results[dataset] = {'cosine_pearsonr': pearsonr(cosine_scores, gs_scores),
+                                'cosine_spearmanr': spearmanr(cosine_scores, gs_scores),
+                                'euclidean_peasonr':pearsonr(euclidean_scores, gs_scores),
+                                'euclidean_spearmanr':spearmanr(euclidean_scores, gs_scores),
+                                'manhattan_pearsonr':pearsonr(manhattan_scores, gs_scores),
+                                'manhattan_spearmanr':spearmanr(manhattan_scores, gs_scores),
+                                'nsamples': len(gs_scores)}
+
+            return results
 
             all_sys_scores.extend(sys_scores)
             all_gs_scores.extend(gs_scores)
@@ -376,19 +398,34 @@ class KorSTS(STSEval):
 
 class KLUESTS(STSEval):
     def __init__(self):
-        STS_data = load_dataset("klue", "sts", ignore_verifications=True)
+        use_dev = False
+        if use_dev:
+            pd_STS = load_dataset("klue", "sts", ignore_verifications=True)["validation"].to_pandas()
+            pd_STS = pd_STS.dropna(axis=0).loc[:,["sentence1", "sentence2", "labels"]]
+            sel_gs_scores = lambda x: x["label"]
+            pd_STS["labels"] = pd_STS["labels"].apply(func=sel_gs_scores)
+            gs_scores = pd_STS["labels"].values.tolist()[:]
 
-        split_data = [STS_data[name] for name in STS_data]
-        pd_STS = concatenate_datasets(split_data).to_pandas()
-        pd_STS = pd_STS.dropna(axis=0).loc[:,["sentence1", "sentence2", "labels"]]
+            sentence1 = sum(pd_STS.loc[:,["sentence1"]].values.tolist(), [])[:]
+            sentence2 = sum(pd_STS.loc[:,["sentence2"]].values.tolist(), [])[:]
+            
+            self.datasets = ["dev"]
+            self.data = {"dev": [sentence1, sentence2, gs_scores]}
+            self.samples = sentence1
+        else:
+            STS_data = load_dataset("klue", "sts", ignore_verifications=True)
 
-        sel_gs_scores = lambda x: x["label"]
-        pd_STS["labels"] = pd_STS["labels"].apply(func=sel_gs_scores)
-        gs_scores = pd_STS["labels"].values.tolist()[:]
+            split_data = [STS_data[name] for name in STS_data]
+            pd_STS = concatenate_datasets(split_data).to_pandas()
+            pd_STS = pd_STS.dropna(axis=0).loc[:,["sentence1", "sentence2", "labels"]]
 
-        sentence1 = sum(pd_STS.loc[:,["sentence1"]].values.tolist(), [])[:]
-        sentence2 = sum(pd_STS.loc[:,["sentence2"]].values.tolist(), [])[:]
-        
-        self.datasets = ["dev"]
-        self.data = {"dev": [sentence1, sentence2, gs_scores]}
-        self.samples = sentence1
+            sel_gs_scores = lambda x: x["label"]
+            pd_STS["labels"] = pd_STS["labels"].apply(func=sel_gs_scores)
+            gs_scores = pd_STS["labels"].values.tolist()[:]
+
+            sentence1 = sum(pd_STS.loc[:,["sentence1"]].values.tolist(), [])[:]
+            sentence2 = sum(pd_STS.loc[:,["sentence2"]].values.tolist(), [])[:]
+            
+            self.datasets = ["dev"]
+            self.data = {"dev": [sentence1, sentence2, gs_scores]}
+            self.samples = sentence1
